@@ -1,0 +1,1252 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Item class="Script" referent="RBX0">
+		<Properties>
+			<string name="Name">StudioLink</string>
+			<token name="RunContext">0</token>
+			<ProtectedString name="Source"><![CDATA[--[[
+	Studio Link — lets Claude read and edit your open Roblox Studio place.
+
+	How it works: this plugin long-polls your Studio Link relay (a Cloudflare Worker).
+	Claude sends tool calls to the relay through a custom connector URL; the plugin
+	picks them up, runs them here in Studio, and posts the results back.
+
+	Every change goes through ChangeHistoryService, so Ctrl/Cmd+Z undoes Claude's edits.
+]]
+
+local VERSION = "1.0.0"
+
+local HttpService = game:GetService("HttpService")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local Selection = game:GetService("Selection")
+local LogService = game:GetService("LogService")
+local CollectionService = game:GetService("CollectionService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local RunService = game:GetService("RunService")
+
+-- Studio also loads plugins inside Play-test sessions. Only the edit window should connect,
+-- otherwise every playtest starts extra copies polling the relay.
+if RunService:IsRunning() then
+	return
+end
+
+local SETTING_URL = "StudioLink_ServerUrl"
+local SETTING_TOKEN = "StudioLink_Token"
+local SETTING_AUTO = "StudioLink_AutoConnect"
+
+--------------------------------------------------------------------------------
+-- Settings
+--------------------------------------------------------------------------------
+
+local function newToken()
+	local a = HttpService:GenerateGUID(false):gsub("-", "")
+	local b = HttpService:GenerateGUID(false):gsub("-", "")
+	return a .. b
+end
+
+local serverUrl = plugin:GetSetting(SETTING_URL) or ""
+local token = plugin:GetSetting(SETTING_TOKEN)
+if type(token) ~= "string" or #token < 32 then
+	token = newToken()
+	plugin:SetSetting(SETTING_TOKEN, token)
+end
+
+local function cleanUrl(u)
+	u = tostring(u or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+	if u ~= "" and not u:match("^https?://") then
+		u = "https://" .. u
+	end
+	-- Keep only scheme + host, so pasting the connector link (…/mcp/<secret>) here still works
+	local base = u:match("^(https?://[^/]+)")
+	return base or u
+end
+
+local function connectorUrl()
+	if serverUrl == "" then
+		return ""
+	end
+	return serverUrl .. "/mcp/" .. token
+end
+
+--------------------------------------------------------------------------------
+-- Output capture
+--------------------------------------------------------------------------------
+
+local outputBuffer = {}
+local MAX_OUTPUT = 500
+local messageTypeNames = {
+	[Enum.MessageType.MessageOutput] = "print",
+	[Enum.MessageType.MessageInfo] = "info",
+	[Enum.MessageType.MessageWarning] = "warn",
+	[Enum.MessageType.MessageError] = "error",
+}
+
+local outputConn = LogService.MessageOut:Connect(function(message, messageType)
+	table.insert(outputBuffer, { kind = messageTypeNames[messageType] or "print", text = message })
+	if #outputBuffer > MAX_OUTPUT then
+		table.remove(outputBuffer, 1)
+	end
+end)
+
+--------------------------------------------------------------------------------
+-- Paths
+--------------------------------------------------------------------------------
+
+local function pathOf(inst)
+	if inst == game then
+		return "game"
+	end
+	local parts = {}
+	local cur = inst
+	while cur and cur ~= game do
+		table.insert(parts, 1, cur.Name)
+		cur = cur.Parent
+	end
+	if cur == nil then
+		return "(not in game)/" .. table.concat(parts, "/")
+	end
+	return table.concat(parts, "/")
+end
+
+local function splitPath(p)
+	local parts = {}
+	for seg in string.gmatch(p, "[^/]+") do
+		table.insert(parts, seg)
+	end
+	return parts
+end
+
+local function resolve(path)
+	if path == nil or path == "" or path == "game" or path == "/" then
+		return game
+	end
+	if type(path) ~= "string" then
+		error("Path must be a string", 0)
+	end
+	path = path:gsub("^@", ""):gsub("^game%.", "")
+	local parts = splitPath(path)
+	local start = (parts[1] == "game") and 2 or 1
+	local cur = game
+	for i = start, #parts do
+		local name = parts[i]
+		local nextInst = cur:FindFirstChild(name)
+		if not nextInst and cur == game then
+			local ok, svc = pcall(function()
+				return game:FindService(name)
+			end)
+			if ok then
+				nextInst = svc
+			end
+		end
+		if not nextInst then
+			error(("Nothing named %q inside %s"):format(name, pathOf(cur)), 0)
+		end
+		cur = nextInst
+	end
+	return cur
+end
+
+local function parentAndName(path)
+	local parts = splitPath((path:gsub("^@", "")))
+	if #parts == 0 then
+		error("Empty path", 0)
+	end
+	local name = table.remove(parts)
+	local parent = resolve(table.concat(parts, "/"))
+	return parent, name
+end
+
+--------------------------------------------------------------------------------
+-- Value conversion
+--------------------------------------------------------------------------------
+
+local function fmt(n)
+	if n ~= n then
+		return "nan"
+	end
+	if n == math.floor(n) and math.abs(n) < 1e15 then
+		return tostring(math.floor(n))
+	end
+	local s = string.format("%.4f", n):gsub("0+$", ""):gsub("%.$", "")
+	return s
+end
+
+local function joinNums(...)
+	local t = {}
+	for _, v in ipairs({ ... }) do
+		table.insert(t, fmt(v))
+	end
+	return table.concat(t, ", ")
+end
+
+-- Instance/Roblox value -> JSON-friendly value
+local function ser(v)
+	local t = typeof(v)
+	if t == "nil" or t == "boolean" or t == "string" then
+		return v
+	elseif t == "number" then
+		if v ~= v or v == math.huge or v == -math.huge then
+			return tostring(v)
+		end
+		return v
+	elseif t == "Vector3" then
+		return ("Vector3(%s)"):format(joinNums(v.X, v.Y, v.Z))
+	elseif t == "Vector2" then
+		return ("Vector2(%s)"):format(joinNums(v.X, v.Y))
+	elseif t == "CFrame" then
+		return ("CFrame(%s)"):format(joinNums(v:GetComponents()))
+	elseif t == "Color3" then
+		return "#" .. v:ToHex()
+	elseif t == "BrickColor" then
+		return v.Name
+	elseif t == "EnumItem" then
+		return tostring(v)
+	elseif t == "Instance" then
+		return "@" .. pathOf(v)
+	elseif t == "UDim2" then
+		return ("UDim2(%s)"):format(joinNums(v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset))
+	elseif t == "UDim" then
+		return ("UDim(%s)"):format(joinNums(v.Scale, v.Offset))
+	elseif t == "NumberRange" then
+		return ("NumberRange(%s)"):format(joinNums(v.Min, v.Max))
+	else
+		return t .. "(" .. tostring(v) .. ")"
+	end
+end
+
+local function nums(v)
+	if type(v) == "table" then
+		if v.x or v.X then
+			return { v.x or v.X, v.y or v.Y, v.z or v.Z }
+		end
+		local out = {}
+		for _, n in ipairs(v) do
+			table.insert(out, tonumber(n))
+		end
+		return out
+	end
+	if type(v) == "number" then
+		return { v }
+	end
+	local s = tostring(v)
+	local open = s:find("(", 1, true)
+	if open then
+		s = s:sub(open + 1)
+	end
+	local out = {}
+	for token in s:gmatch("[%-%+]?[%d%.]+[eE]?[%-%+]?%d*") do
+		local n = tonumber(token)
+		if n then
+			table.insert(out, n)
+		end
+	end
+	return out
+end
+
+-- JSON value -> Roblox value, guided by the property's current value type
+local function deser(value, current)
+	if type(value) == "string" and value:sub(1, 1) == "@" then
+		return resolve(value:sub(2))
+	end
+	if value == nil then
+		return nil
+	end
+	local t = typeof(current)
+	if t == "Vector3" then
+		local n = nums(value)
+		return Vector3.new(n[1] or 0, n[2] or 0, n[3] or 0)
+	elseif t == "Vector2" then
+		local n = nums(value)
+		return Vector2.new(n[1] or 0, n[2] or 0)
+	elseif t == "CFrame" then
+		local n = nums(value)
+		if #n >= 12 then
+			return CFrame.new(table.unpack(n, 1, 12))
+		elseif #n >= 6 then
+			return CFrame.new(n[1], n[2], n[3]) * CFrame.Angles(math.rad(n[4]), math.rad(n[5]), math.rad(n[6]))
+		else
+			return CFrame.new(n[1] or 0, n[2] or 0, n[3] or 0)
+		end
+	elseif t == "Color3" then
+		if type(value) == "string" and value:match("^#?%x%x%x%x%x%x$") then
+			return Color3.fromHex(value)
+		elseif type(value) == "string" and not value:find("%d") then
+			return BrickColor.new(value).Color
+		end
+		local n = nums(value)
+		if (n[1] or 0) > 1 or (n[2] or 0) > 1 or (n[3] or 0) > 1 then
+			return Color3.fromRGB(n[1] or 0, n[2] or 0, n[3] or 0)
+		end
+		return Color3.new(n[1] or 0, n[2] or 0, n[3] or 0)
+	elseif t == "BrickColor" then
+		if type(value) == "number" then
+			return BrickColor.new(value)
+		end
+		return BrickColor.new(tostring(value))
+	elseif t == "EnumItem" then
+		if type(value) == "number" then
+			for _, item in ipairs(current.EnumType:GetEnumItems()) do
+				if item.Value == value then
+					return item
+				end
+			end
+			error(("%s has no value %d"):format(tostring(current.EnumType), value), 0)
+		end
+		local name = tostring(value):match("([^%.]+)$")
+		local ok, item = pcall(function()
+			return (current.EnumType :: any)[name]
+		end)
+		if not ok or item == nil then
+			error(("%q is not a valid %s"):format(tostring(value), tostring(current.EnumType)), 0)
+		end
+		return item
+	elseif t == "UDim2" then
+		local n = nums(value)
+		return UDim2.new(n[1] or 0, n[2] or 0, n[3] or 0, n[4] or 0)
+	elseif t == "UDim" then
+		local n = nums(value)
+		return UDim.new(n[1] or 0, n[2] or 0)
+	elseif t == "NumberRange" then
+		local n = nums(value)
+		return NumberRange.new(n[1] or 0, n[2] or n[1] or 0)
+	elseif t == "number" then
+		local n = tonumber(value)
+		if n == nil then
+			error(("Expected a number, got %s"):format(tostring(value)), 0)
+		end
+		return n
+	elseif t == "string" then
+		return tostring(value)
+	elseif t == "boolean" then
+		if type(value) == "string" then
+			return value == "true"
+		end
+		return value and true or false
+	end
+	return value
+end
+
+local function setProperty(inst, prop, value)
+	if prop == "Attributes" and type(value) == "table" then
+		for k, v in pairs(value) do
+			local current = inst:GetAttribute(k)
+			if v ~= nil and current ~= nil then
+				v = deser(v, current)
+			elseif type(v) == "string" and v:match("^#%x%x%x%x%x%x$") then
+				v = Color3.fromHex(v)
+			end
+			inst:SetAttribute(k, v)
+		end
+		return
+	end
+	if prop == "Tags" and type(value) == "table" then
+		for _, tag in ipairs(CollectionService:GetTags(inst)) do
+			CollectionService:RemoveTag(inst, tag)
+		end
+		for _, tag in ipairs(value) do
+			CollectionService:AddTag(inst, tostring(tag))
+		end
+		return
+	end
+	if prop == "Source" and inst:IsA("LuaSourceContainer") then
+		local ok = pcall(function()
+			ScriptEditorService:UpdateSourceAsync(inst, function()
+				return tostring(value)
+			end)
+		end)
+		if not ok then
+			(inst :: any).Source = tostring(value)
+		end
+		return
+	end
+	local okRead, current = pcall(function()
+		return (inst :: any)[prop]
+	end)
+	if not okRead then
+		error(("%s has no property %q"):format(inst.ClassName, prop), 0)
+	end
+	local converted = deser(value, current)
+	local okSet, err = pcall(function()
+		(inst :: any)[prop] = converted
+	end)
+	if not okSet then
+		error(("Couldn't set %s.%s: %s"):format(pathOf(inst), prop, tostring(err)), 0)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Property listing
+--------------------------------------------------------------------------------
+
+local COMMON_PROPS = {
+	"Name", "ClassName", "Parent", "Archivable",
+	-- BasePart
+	"Anchored", "CanCollide", "CanTouch", "CanQuery", "CastShadow", "Massless", "Locked",
+	"Position", "Orientation", "Size", "CFrame", "Color", "BrickColor", "Material", "Transparency",
+	"Reflectance", "Shape", "AssemblyLinearVelocity", "CollisionGroup",
+	-- Model
+	"PrimaryPart", "WorldPivot",
+	-- Scripts
+	"Enabled", "Disabled", "RunContext",
+	-- GUI
+	"Visible", "Text", "TextColor3", "TextSize", "TextScaled", "Font", "BackgroundColor3",
+	"BackgroundTransparency", "AnchorPoint", "ZIndex", "LayoutOrder", "Image", "ResetOnSpawn",
+	-- Lights/effects/sound
+	"Brightness", "Range", "Shadows", "SoundId", "Volume", "Looped", "Playing", "Texture",
+	-- Values
+	"Value", "MaxForce", "Velocity",
+	-- Humanoid
+	"Health", "MaxHealth", "WalkSpeed", "JumpPower", "JumpHeight", "DisplayName",
+	-- Lighting
+	"ClockTime", "Ambient", "OutdoorAmbient", "FogEnd", "FogColor", "GlobalShadows",
+	-- Mesh/decals
+	"MeshId", "TextureID", "Face",
+}
+
+local function propertyNames(inst)
+	local names = {}
+	local ok, list = pcall(function()
+		return (game:GetService("ReflectionService") :: any):GetPropertiesOfClass(inst.ClassName)
+	end)
+	if ok and type(list) == "table" and #list > 0 then
+		for _, entry in ipairs(list) do
+			local n = (type(entry) == "table" and entry.Name) or (type(entry) == "string" and entry) or nil
+			if n then
+				table.insert(names, n)
+			end
+		end
+	end
+	if #names == 0 then
+		names = COMMON_PROPS
+	end
+	return names
+end
+
+--------------------------------------------------------------------------------
+-- Undo helper
+--------------------------------------------------------------------------------
+
+local function withUndo(label, fn, ...)
+	local recording = ChangeHistoryService:TryBeginRecording("Claude: " .. label)
+	local results = table.pack(pcall(fn, ...))
+	if recording then
+		ChangeHistoryService:FinishRecording(
+			recording,
+			results[1] and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
+		)
+	end
+	if not results[1] then
+		error(results[2], 0)
+	end
+	return table.unpack(results, 2, results.n)
+end
+
+--------------------------------------------------------------------------------
+-- Script helpers
+--------------------------------------------------------------------------------
+
+local function getSource(inst)
+	if not inst:IsA("LuaSourceContainer") then
+		error(pathOf(inst) .. " is a " .. inst.ClassName .. ", not a script", 0)
+	end
+	local ok, src = pcall(function()
+		return ScriptEditorService:GetEditorSource(inst)
+	end)
+	if ok and type(src) == "string" then
+		return src
+	end
+	return (inst :: any).Source
+end
+
+local function setSource(inst, source)
+	setProperty(inst, "Source", source)
+end
+
+local function countOccurrences(haystack, needle)
+	local count, pos = 0, 1
+	while true do
+		local s, e = string.find(haystack, needle, pos, true)
+		if not s then
+			break
+		end
+		count += 1
+		pos = e + 1
+	end
+	return count
+end
+
+local function plainReplace(haystack, needle, replacement, all)
+	local out, pos = {}, 1
+	while true do
+		local s, e = string.find(haystack, needle, pos, true)
+		if not s then
+			break
+		end
+		table.insert(out, haystack:sub(pos, s - 1))
+		table.insert(out, replacement)
+		pos = e + 1
+		if not all then
+			break
+		end
+	end
+	table.insert(out, haystack:sub(pos))
+	return table.concat(out)
+end
+
+--------------------------------------------------------------------------------
+-- Commands
+--------------------------------------------------------------------------------
+
+local Commands = {}
+
+function Commands.get_tree(args)
+	local root = resolve(args.path)
+	local maxDepth = math.clamp(tonumber(args.depth) or 2, 1, 10)
+	local maxNodes = math.clamp(tonumber(args.maxNodes) or 400, 10, 3000)
+	local lines, count, truncated = {}, 0, false
+
+	local function line(inst, level)
+		local n = #inst:GetChildren()
+		local extra = (level >= maxDepth and n > 0) and ("  (+" .. n .. " children)") or ""
+		table.insert(lines, string.rep("  ", level) .. inst.Name .. " [" .. inst.ClassName .. "]" .. extra)
+	end
+
+	local function walk(inst, level)
+		for _, child in ipairs(inst:GetChildren()) do
+			if count >= maxNodes then
+				truncated = true
+				return
+			end
+			count += 1
+			line(child, level)
+			if level < maxDepth then
+				walk(child, level + 1)
+			end
+		end
+	end
+
+	table.insert(lines, pathOf(root) .. " [" .. root.ClassName .. "]")
+	if root == game then
+		-- Only the services people actually build in
+		local interesting = {
+			"Workspace", "Players", "Lighting", "MaterialService", "ReplicatedFirst", "ReplicatedStorage",
+			"ServerScriptService", "ServerStorage", "StarterGui", "StarterPack", "StarterPlayer", "Teams",
+			"SoundService", "TextChatService",
+		}
+		for _, name in ipairs(interesting) do
+			local svc = game:FindService(name)
+			if svc then
+				count += 1
+				line(svc, 1)
+				if maxDepth > 1 then
+					walk(svc, 2)
+				end
+			end
+		end
+	else
+		walk(root, 1)
+	end
+	if truncated then
+		table.insert(lines, ("… stopped at %d nodes; narrow the path or raise maxNodes"):format(maxNodes))
+	end
+	return table.concat(lines, "\n")
+end
+
+function Commands.get_properties(args)
+	local inst = resolve(args.path)
+	local names = (type(args.names) == "table" and #args.names > 0) and args.names or propertyNames(inst)
+	local props = {}
+	for _, name in ipairs(names) do
+		local ok, value = pcall(function()
+			return (inst :: any)[name]
+		end)
+		if ok and typeof(value) ~= "RBXScriptSignal" and typeof(value) ~= "function" then
+			props[name] = ser(value)
+		end
+	end
+	props.Source = nil -- use read_script
+	local attrs = {}
+	for k, v in pairs(inst:GetAttributes()) do
+		attrs[k] = ser(v)
+	end
+	return {
+		path = pathOf(inst),
+		className = inst.ClassName,
+		properties = props,
+		attributes = attrs,
+		tags = CollectionService:GetTags(inst),
+		childCount = #inst:GetChildren(),
+	}
+end
+
+function Commands.set_properties(args)
+	local paths = args.paths or { args.path }
+	if type(args.properties) ~= "table" then
+		error("properties must be an object", 0)
+	end
+	return withUndo("set properties", function()
+		local done = {}
+		for _, p in ipairs(paths) do
+			local inst = resolve(p)
+			-- Parent last so other properties apply first
+			for prop, value in pairs(args.properties) do
+				if prop ~= "Parent" then
+					setProperty(inst, prop, value)
+				end
+			end
+			if args.properties.Parent ~= nil then
+				setProperty(inst, "Parent", args.properties.Parent)
+			end
+			table.insert(done, pathOf(inst))
+		end
+		return "Updated: " .. table.concat(done, ", ")
+	end)
+end
+
+function Commands.create_instance(args)
+	return withUndo("create " .. tostring(args.className), function()
+		local parent = resolve(args.parent)
+		local ok, inst = pcall(Instance.new, args.className)
+		if not ok then
+			error(("Can't create a %q: %s"):format(tostring(args.className), tostring(inst)), 0)
+		end
+		if args.name then
+			inst.Name = args.name
+		end
+		if type(args.properties) == "table" then
+			for prop, value in pairs(args.properties) do
+				if prop ~= "Parent" then
+					setProperty(inst, prop, value)
+				end
+			end
+		end
+		if args.source and inst:IsA("LuaSourceContainer") then
+			(inst :: any).Source = args.source
+		end
+		inst.Parent = parent
+		return "Created " .. pathOf(inst)
+	end)
+end
+
+function Commands.clone_instance(args)
+	return withUndo("clone", function()
+		local inst = resolve(args.path)
+		local copy = inst:Clone()
+		if not copy then
+			error(pathOf(inst) .. " can't be cloned (Archivable is false?)", 0)
+		end
+		if args.name then
+			copy.Name = args.name
+		end
+		copy.Parent = args.parent and resolve(args.parent) or inst.Parent
+		return "Created " .. pathOf(copy)
+	end)
+end
+
+function Commands.delete_instance(args)
+	local paths = args.paths or { args.path }
+	return withUndo("delete", function()
+		local done = {}
+		for _, p in ipairs(paths) do
+			local inst = resolve(p)
+			if inst == game or inst.Parent == game then
+				error("Refusing to delete a service: " .. pathOf(inst), 0)
+			end
+			table.insert(done, pathOf(inst))
+			inst:Destroy()
+		end
+		return "Deleted: " .. table.concat(done, ", ")
+	end)
+end
+
+function Commands.read_script(args)
+	local inst = resolve(args.path)
+	local src = getSource(inst)
+	local lines = string.split(src, "\n")
+	local first = math.max(1, tonumber(args.startLine) or 1)
+	local last = math.min(#lines, tonumber(args.endLine) or #lines)
+	local out = { ("-- %s [%s] — %d lines"):format(pathOf(inst), inst.ClassName, #lines) }
+	for i = first, last do
+		table.insert(out, ("%4d  %s"):format(i, lines[i]))
+	end
+	return table.concat(out, "\n")
+end
+
+function Commands.write_script(args)
+	if type(args.source) ~= "string" then
+		error("source must be a string", 0)
+	end
+	return withUndo("write script", function()
+		local ok, existing = pcall(resolve, args.path)
+		if ok and existing ~= game then
+			setSource(existing, args.source)
+			return ("Updated %s (%d lines)"):format(pathOf(existing), #string.split(args.source, "\n"))
+		end
+		local parent, name = parentAndName(args.path)
+		local className = args.className or "Script"
+		local inst = Instance.new(className)
+		inst.Name = name;
+		(inst :: any).Source = args.source
+		inst.Parent = parent
+		return ("Created %s %s (%d lines)"):format(className, pathOf(inst), #string.split(args.source, "\n"))
+	end)
+end
+
+function Commands.edit_script(args)
+	local inst = resolve(args.path)
+	local src = getSource(inst)
+	if type(args.old) ~= "string" or args.old == "" then
+		error("old must be non-empty text", 0)
+	end
+	local n = countOccurrences(src, args.old)
+	if n == 0 then
+		error("The text to replace wasn't found in " .. pathOf(inst) .. ". Read the script again and copy the exact text.", 0)
+	end
+	if n > 1 and not args.replaceAll then
+		error(("The text appears %d times in %s. Include more surrounding lines, or set replaceAll."):format(n, pathOf(inst)), 0)
+	end
+	local newSrc = plainReplace(src, args.old, tostring(args.new or ""), args.replaceAll)
+	withUndo("edit script", setSource, inst, newSrc)
+	return ("Edited %s (%d replacement%s)"):format(pathOf(inst), args.replaceAll and n or 1, (args.replaceAll and n > 1) and "s" or "")
+end
+
+function Commands.search(args)
+	local root = resolve(args.root)
+	local query = args.query and string.lower(tostring(args.query)) or nil
+	local limit = math.clamp(tonumber(args.limit) or 50, 1, 500)
+	local results = {}
+	for _, inst in ipairs(root:GetDescendants()) do
+		if #results >= limit then
+			table.insert(results, "… (limit reached)")
+			break
+		end
+		local okClass = (not args.className) or inst:IsA(args.className)
+		if okClass then
+			if args.inSource then
+				if inst:IsA("LuaSourceContainer") and query then
+					local ok, src = pcall(getSource, inst)
+					if ok then
+						local lines = string.split(src, "\n")
+						for i, line in ipairs(lines) do
+							if string.find(string.lower(line), query, 1, true) then
+								table.insert(results, ("%s:%d  %s"):format(pathOf(inst), i, (line:gsub("^%s+", ""))))
+								if #results >= limit then
+									break
+								end
+							end
+						end
+					end
+				end
+			elseif not query or string.find(string.lower(inst.Name), query, 1, true) then
+				table.insert(results, pathOf(inst) .. " [" .. inst.ClassName .. "]")
+			end
+		end
+	end
+	if #results == 0 then
+		return "No matches."
+	end
+	return table.concat(results, "\n")
+end
+
+function Commands.get_selection()
+	local sel = Selection:Get()
+	if #sel == 0 then
+		return "Nothing is selected."
+	end
+	local out = {}
+	for _, inst in ipairs(sel) do
+		table.insert(out, pathOf(inst) .. " [" .. inst.ClassName .. "]")
+	end
+	return table.concat(out, "\n")
+end
+
+function Commands.set_selection(args)
+	local list = {}
+	for _, p in ipairs(args.paths or {}) do
+		table.insert(list, resolve(p))
+	end
+	Selection:Set(list)
+	return ("Selected %d instance(s)"):format(#list)
+end
+
+function Commands.get_output(args)
+	local limit = math.clamp(tonumber(args.limit) or 50, 1, MAX_OUTPUT)
+	local out = {}
+	for i = math.max(1, #outputBuffer - limit + 1), #outputBuffer do
+		local m = outputBuffer[i]
+		table.insert(out, "[" .. m.kind .. "] " .. m.text)
+	end
+	if args.clear then
+		table.clear(outputBuffer)
+	end
+	if #out == 0 then
+		return "(no output captured yet)"
+	end
+	return table.concat(out, "\n")
+end
+
+local function compile(code)
+	-- Prefer loadstring when Studio allows it for plugins; otherwise use a temporary ModuleScript.
+	local okLs, fn, err = pcall(function()
+		return (loadstring :: any)(code, "=run_luau")
+	end)
+	if okLs and type(fn) == "function" then
+		return fn
+	end
+	if okLs and fn == nil and err then
+		error("Syntax error: " .. tostring(err), 0)
+	end
+	local module = Instance.new("ModuleScript")
+	module.Name = "StudioLinkRun"
+	module.Source = "return function(...)\n" .. code .. "\nend"
+	local okReq, result = pcall(require, module)
+	module:Destroy()
+	if not okReq then
+		error("Couldn't compile the code (syntax error?): " .. tostring(result), 0)
+	end
+	return result
+end
+
+function Commands.run_luau(args)
+	local code = tostring(args.code or "")
+	local fn = compile(code)
+	local captured = {}
+	local conn = LogService.MessageOut:Connect(function(message, messageType)
+		table.insert(captured, "[" .. (messageTypeNames[messageType] or "print") .. "] " .. message)
+	end)
+	local results = table.pack(pcall(withUndo, "run Luau", fn))
+	task.wait() -- let deferred output events arrive
+	conn:Disconnect()
+
+	local out = {}
+	if #captured > 0 then
+		table.insert(out, "Output:\n" .. table.concat(captured, "\n"))
+	end
+	if not results[1] then
+		table.insert(out, "Error: " .. tostring(results[2]))
+		error(table.concat(out, "\n\n"), 0)
+	end
+	if results.n > 1 then
+		local rets = {}
+		for i = 2, results.n do
+			local v = results[i]
+			if type(v) == "table" then
+				local ok, encoded = pcall(function()
+					local copy = {}
+					for k, val in pairs(v) do
+						copy[tostring(k)] = ser(val)
+					end
+					return HttpService:JSONEncode(copy)
+				end)
+				table.insert(rets, ok and encoded or tostring(v))
+			else
+				local s = ser(v)
+				table.insert(rets, tostring(s))
+			end
+		end
+		table.insert(out, "Returned: " .. table.concat(rets, ", "))
+	end
+	if #out == 0 then
+		return "(ran with no output)"
+	end
+	return table.concat(out, "\n\n")
+end
+
+--------------------------------------------------------------------------------
+-- UI
+--------------------------------------------------------------------------------
+
+local toolbar = plugin:CreateToolbar("Studio Link")
+local toggleButton = toolbar:CreateButton(
+	"StudioLink",
+	"Connect Claude to this place",
+	"rbxasset://textures/StudioToolbox/AssetPreview/Asset_Preview_Play.png",
+	"Studio Link"
+)
+toggleButton.ClickableWhenViewportHidden = true
+
+local widget = plugin:CreateDockWidgetPluginGui(
+	"StudioLinkPanel",
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 320, 420, 260, 300)
+)
+widget.Title = "Studio Link"
+widget.Name = "StudioLinkPanel"
+
+toggleButton.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	toggleButton:SetActive(widget.Enabled)
+end)
+
+local theme = settings().Studio.Theme
+local function color(c, mod)
+	return theme:GetColor(c, mod or Enum.StudioStyleGuideModifier.Default)
+end
+
+local root = Instance.new("ScrollingFrame")
+root.Size = UDim2.fromScale(1, 1)
+root.BorderSizePixel = 0
+root.ScrollBarThickness = 6
+root.AutomaticCanvasSize = Enum.AutomaticSize.Y
+root.CanvasSize = UDim2.new()
+root.Parent = widget
+
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 10)
+pad.PaddingBottom = UDim.new(0, 10)
+pad.PaddingLeft = UDim.new(0, 10)
+pad.PaddingRight = UDim.new(0, 10)
+pad.Parent = root
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 6)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = root
+
+local themed = {}
+local order = 0
+local function nextOrder()
+	order += 1
+	return order
+end
+
+local function label(text, opts)
+	opts = opts or {}
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Size = UDim2.new(1, 0, 0, 0)
+	l.AutomaticSize = Enum.AutomaticSize.Y
+	l.TextWrapped = true
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Font = opts.bold and Enum.Font.SourceSansBold or Enum.Font.SourceSans
+	l.TextSize = opts.size or 14
+	l.Text = text
+	l.RichText = true
+	l.LayoutOrder = nextOrder()
+	l.Parent = root
+	table.insert(themed, function()
+		l.TextColor3 = color(opts.dim and Enum.StudioStyleGuideColor.DimmedText or Enum.StudioStyleGuideColor.MainText)
+	end)
+	return l
+end
+
+local function textBox(placeholder, editable)
+	local b = Instance.new("TextBox")
+	b.Size = UDim2.new(1, 0, 0, 26)
+	b.ClearTextOnFocus = false
+	b.TextEditable = editable
+	b.PlaceholderText = placeholder
+	b.Font = Enum.Font.Code
+	b.TextSize = 13
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.TextTruncate = Enum.TextTruncate.AtEnd
+	b.Text = ""
+	b.LayoutOrder = nextOrder()
+	local p = Instance.new("UIPadding")
+	p.PaddingLeft = UDim.new(0, 6)
+	p.PaddingRight = UDim.new(0, 6)
+	p.Parent = b
+	local stroke = Instance.new("UIStroke")
+	stroke.Parent = b
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+	b.Parent = root
+	table.insert(themed, function()
+		b.BackgroundColor3 = color(Enum.StudioStyleGuideColor.InputFieldBackground)
+		b.TextColor3 = color(Enum.StudioStyleGuideColor.MainText)
+		b.PlaceholderColor3 = color(Enum.StudioStyleGuideColor.DimmedText)
+		stroke.Color = color(Enum.StudioStyleGuideColor.InputFieldBorder)
+	end)
+	return b
+end
+
+local function button(text, primary)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 28)
+	b.Font = Enum.Font.SourceSansBold
+	b.TextSize = 14
+	b.Text = text
+	b.AutoButtonColor = true
+	b.LayoutOrder = nextOrder()
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+	b.Parent = root
+	table.insert(themed, function()
+		if primary then
+			b.BackgroundColor3 = color(Enum.StudioStyleGuideColor.DialogMainButton)
+			b.TextColor3 = color(Enum.StudioStyleGuideColor.DialogMainButtonText)
+		else
+			b.BackgroundColor3 = color(Enum.StudioStyleGuideColor.Button)
+			b.TextColor3 = color(Enum.StudioStyleGuideColor.ButtonText)
+		end
+	end)
+	return b
+end
+
+label("Studio Link", { bold = true, size = 18 })
+local statusLabel = label("● Not connected", { bold = true })
+
+label("1. Relay URL (your Cloudflare Worker)", { bold = true })
+local urlBox = textBox("https://studio-link.yourname.workers.dev", true)
+urlBox.Text = serverUrl
+
+local connectButton = button("Connect", true)
+
+label("2. Claude connector URL", { bold = true })
+label("In Claude: Settings → Connectors → Add custom connector, and paste this. Keep it private — it can edit this place.", { dim = true, size = 13 })
+local connectorBox = textBox("(enter the relay URL first)", true)
+local copyButton = button("Copy connector link", true)
+local newTokenButton = button("Make a new secret URL", false)
+
+label("Activity", { bold = true })
+local activityLabel = label("", { dim = true, size = 13 })
+activityLabel.Font = Enum.Font.Code
+
+local function applyTheme()
+	root.BackgroundColor3 = color(Enum.StudioStyleGuideColor.MainBackground)
+	root.ScrollBarImageColor3 = color(Enum.StudioStyleGuideColor.ScrollBar)
+	for _, f in ipairs(themed) do
+		f()
+	end
+end
+applyTheme()
+settings().Studio.ThemeChanged:Connect(function()
+	theme = settings().Studio.Theme
+	applyTheme()
+end)
+
+local activity = {}
+local function logActivity(text)
+	table.insert(activity, 1, os.date("%H:%M:%S") .. "  " .. text)
+	while #activity > 12 do
+		table.remove(activity)
+	end
+	activityLabel.Text = table.concat(activity, "\n")
+end
+
+local function setStatus(state, detail)
+	if state == "connected" then
+		statusLabel.Text = '<font color="#3fb950">●</font> Connected' .. (detail and (" — " .. detail) or "")
+	elseif state == "connecting" then
+		statusLabel.Text = '<font color="#d29922">●</font> Connecting…'
+	elseif state == "error" then
+		statusLabel.Text = '<font color="#f85149">●</font> ' .. (detail or "Error")
+	else
+		statusLabel.Text = '<font color="#8b949e">●</font> Not connected'
+	end
+end
+
+local function refreshConnector()
+	connectorBox.Text = connectorUrl()
+end
+refreshConnector()
+
+--------------------------------------------------------------------------------
+-- Connection loop
+--------------------------------------------------------------------------------
+
+local running = false
+local loopId = 0
+local handled = {} -- id -> cached result body (or true while running)
+local handledOrder = {}
+
+local function post(path, body)
+	return pcall(function()
+		return HttpService:RequestAsync({
+			Url = serverUrl .. "/plugin/" .. token .. path,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode(body),
+		})
+	end)
+end
+
+local function encodeResult(id, ok, value)
+	local body = { id = id, ok = ok }
+	if ok then
+		if type(value) == "table" then
+			local okEnc, encoded = pcall(HttpService.JSONEncode, HttpService, value)
+			body.result = okEnc and encoded or tostring(value)
+		else
+			body.result = value == nil and "(done)" or tostring(value)
+		end
+	else
+		body.error = tostring(value)
+	end
+	return body
+end
+
+local function handleCommand(cmd)
+	local id = cmd.id
+	if handled[id] == true then
+		return -- still running from an earlier delivery
+	elseif type(handled[id]) == "table" then
+		post("/result", handled[id]) -- re-send a result that got lost
+		return
+	end
+	handled[id] = true
+	table.insert(handledOrder, id)
+	if #handledOrder > 200 then
+		handled[table.remove(handledOrder, 1)] = nil
+	end
+
+	local fn = Commands[cmd.name]
+	local ok, value
+	if not fn then
+		ok, value = false, "This plugin doesn't know the command " .. tostring(cmd.name) .. ". Update the Studio Link plugin."
+	else
+		ok, value = pcall(fn, cmd.args or {})
+	end
+	local body = encodeResult(id, ok, value)
+	handled[id] = body
+	logActivity((ok and "✓ " or "✗ ") .. tostring(cmd.name) .. ((cmd.args and cmd.args.path) and (" " .. tostring(cmd.args.path)) or ""))
+	post("/result", body)
+end
+
+local function stop()
+	running = false
+	loopId += 1
+	connectButton.Text = "Connect"
+	setStatus("idle")
+end
+
+local function start()
+	serverUrl = cleanUrl(urlBox.Text)
+	urlBox.Text = serverUrl
+	plugin:SetSetting(SETTING_URL, serverUrl)
+	refreshConnector()
+	if serverUrl == "" then
+		setStatus("error", "Enter your relay URL first")
+		return
+	end
+	running = true
+	loopId += 1
+	local myLoop = loopId
+	plugin:SetSetting(SETTING_AUTO, true)
+	connectButton.Text = "Disconnect"
+	setStatus("connecting")
+
+	task.spawn(function()
+		local failures = 0
+		while running and myLoop == loopId do
+			local startedAt = os.clock()
+			local ok, res = post("/poll", {
+				place = game.Name,
+				placeId = game.PlaceId,
+				version = VERSION,
+			})
+			if myLoop ~= loopId then
+				break
+			end
+			if ok and res.Success then
+				failures = 0
+				setStatus("connected", game.Name)
+				local okDecode, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+				local count = 0
+				if okDecode and type(data) == "table" and type(data.commands) == "table" then
+					for _, cmd in ipairs(data.commands) do
+						count += 1
+						task.spawn(handleCommand, cmd)
+					end
+				else
+					setStatus("error", "That URL isn't a Studio Link relay")
+				end
+				-- Safety net: an empty answer should take ~20s. If it came back fast,
+				-- slow down so we can never flood Roblox's HTTP limit.
+				if count == 0 and os.clock() - startedAt < 2 then
+					task.wait(5)
+				end
+			else
+				failures += 1
+				local detail
+				if ok then
+					detail = ("Relay answered %d %s"):format(res.StatusCode, res.StatusMessage)
+				else
+					detail = tostring(res)
+					if detail:lower():find("exceeded") or detail:lower():find("limit") then
+						detail = "Roblox HTTP limit hit — waiting a minute before retrying"
+						failures = math.max(failures, 30)
+					elseif detail:find("not enabled") or detail:find("permission") or detail:find("denied") then
+						detail = "HTTP blocked — allow this plugin's HTTP access in Plugins → Manage Plugins"
+					end
+				end
+				-- Brief timeouts are normal on long polls; only show errors once they repeat
+				if failures >= 2 then
+					setStatus("error", detail)
+				end
+				task.wait(math.min(2 * failures, 60))
+			end
+		end
+	end)
+end
+
+connectButton.MouseButton1Click:Connect(function()
+	if running then
+		plugin:SetSetting(SETTING_AUTO, false)
+		stop()
+	else
+		start()
+	end
+end)
+
+urlBox.FocusLost:Connect(function()
+	serverUrl = cleanUrl(urlBox.Text)
+	urlBox.Text = serverUrl
+	plugin:SetSetting(SETTING_URL, serverUrl)
+	refreshConnector()
+end)
+
+newTokenButton.MouseButton1Click:Connect(function()
+	token = newToken()
+	plugin:SetSetting(SETTING_TOKEN, token)
+	refreshConnector()
+	logActivity("New secret URL — update the connector in Claude")
+	if running then
+		start()
+	end
+end)
+
+-- The connector box is read-only in practice: any typing is reverted.
+connectorBox:GetPropertyChangedSignal("Text"):Connect(function()
+	local want = connectorUrl()
+	if connectorBox.Text ~= want then
+		connectorBox.Text = want
+	end
+end)
+
+local function selectConnector()
+	connectorBox.CursorPosition = #connectorBox.Text + 1
+	connectorBox.SelectionStart = 1
+end
+connectorBox.Focused:Connect(selectConnector)
+
+-- Plugins can't write to the clipboard, so the button selects the link for a one-key copy.
+local copyResetId = 0
+copyButton.MouseButton1Click:Connect(function()
+	if connectorUrl() == "" then
+		copyButton.Text = "Enter the relay URL first"
+	else
+		connectorBox:CaptureFocus()
+		selectConnector()
+		copyButton.Text = "Selected — press ⌘C (Ctrl+C) to copy"
+	end
+	copyResetId += 1
+	local myId = copyResetId
+	task.delay(4, function()
+		if myId == copyResetId then
+			copyButton.Text = "Copy connector link"
+		end
+	end)
+end)
+
+plugin.Unloading:Connect(function()
+	running = false
+	loopId += 1
+	outputConn:Disconnect()
+end)
+
+if plugin:GetSetting(SETTING_AUTO) and serverUrl ~= "" then
+	start()
+end
+]]></ProtectedString>
+		</Properties>
+	</Item>
+</roblox>
