@@ -13,7 +13,7 @@
 	Every change goes through ChangeHistoryService, so Ctrl/Cmd+Z undoes Claude's edits.
 ]]
 
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
@@ -32,6 +32,11 @@ end
 local SETTING_URL = "StudioLink_ServerUrl"
 local SETTING_TOKEN = "StudioLink_Token"
 local SETTING_AUTO = "StudioLink_AutoConnect"
+local SETTING_GH_REPO = "StudioLink_GithubRepo"
+local SETTING_GH_BRANCH = "StudioLink_GithubBranch"
+local SETTING_GH_AUTO = "StudioLink_GithubAutoPush"
+local SYNC_FOLDER = "place"
+local AUTO_PUSH_SECONDS = 300
 
 --------------------------------------------------------------------------------
 -- Settings
@@ -58,6 +63,14 @@ local function cleanUrl(u)
 	-- Keep only scheme + host, so pasting the connector link (…/mcp/<secret>) here still works
 	local base = u:match("^(https?://[^/]+)")
 	return base or u
+end
+
+local githubRepo = plugin:GetSetting(SETTING_GH_REPO) or ""
+local githubBranch = plugin:GetSetting(SETTING_GH_BRANCH) or "main"
+local githubAutoPush = plugin:GetSetting(SETTING_GH_AUTO) == true
+
+local function githubConfig()
+	return { repo = githubRepo, branch = githubBranch ~= "" and githubBranch or "main", folder = SYNC_FOLDER }
 end
 
 local function connectorUrl()
@@ -784,6 +797,143 @@ function Commands.get_output(args)
 	return table.concat(out, "\n")
 end
 
+--------------------------------------------------------------------------------
+-- GitHub sync: export / import scripts
+--------------------------------------------------------------------------------
+
+local SYNC_SERVICES = {
+	"Workspace", "Lighting", "ReplicatedFirst", "ReplicatedStorage", "ServerScriptService",
+	"ServerStorage", "StarterGui", "StarterPack", "StarterPlayer", "Teams", "SoundService", "TextChatService",
+}
+
+local function safeName(name)
+	local s = name:gsub('[/\\:%*%?"<>|%c]', "_"):gsub("^%s+", ""):gsub("%s+$", "")
+	if s == "" or s == "." or s == ".." then
+		s = "_"
+	end
+	return s
+end
+
+local function extensionFor(inst)
+	if inst:IsA("LocalScript") then
+		return ".client.luau"
+	elseif inst:IsA("ModuleScript") then
+		return ".luau"
+	end
+	return ".server.luau"
+end
+
+local function exportScripts()
+	local files = {}
+	local used = {}
+	for _, serviceName in ipairs(SYNC_SERVICES) do
+		local svc = game:FindService(serviceName)
+		if svc then
+			for _, inst in ipairs(svc:GetDescendants()) do
+				if inst:IsA("LuaSourceContainer") and (inst:IsA("Script") or inst:IsA("LocalScript") or inst:IsA("ModuleScript")) then
+					local okSrc, source = pcall(getSource, inst)
+					if okSrc then
+						local segs = {}
+						local cur = inst
+						while cur and cur ~= game do
+							table.insert(segs, 1, safeName(cur.Name))
+							cur = cur.Parent
+						end
+						local base = table.concat(segs, "/")
+						local ext = extensionFor(inst)
+						local file = base .. ext
+						local n = 2
+						while used[string.lower(file)] do
+							file = base .. " (" .. n .. ")" .. ext
+							n += 1
+						end
+						used[string.lower(file)] = true
+						table.insert(files, {
+							file = file,
+							path = pathOf(inst),
+							className = inst.ClassName,
+							source = source,
+						})
+					end
+				end
+			end
+		end
+	end
+	return files
+end
+
+local function ensurePath(path)
+	-- Returns the parent instance for `path`, creating Folders for anything missing.
+	local parts = splitPath(path)
+	local name = table.remove(parts)
+	local cur = game
+	for i, seg in ipairs(parts) do
+		local nextInst = cur:FindFirstChild(seg)
+		if not nextInst and cur == game then
+			local ok, svc = pcall(function()
+				return game:GetService(seg)
+			end)
+			if ok then
+				nextInst = svc
+			end
+		end
+		if not nextInst then
+			if cur == game then
+				error(("No service named %q"):format(seg), 0)
+			end
+			nextInst = Instance.new("Folder")
+			nextInst.Name = seg
+			nextInst.Parent = cur
+		end
+		cur = nextInst
+		local _ = i
+	end
+	return cur, name
+end
+
+local function importScripts(files)
+	return withUndo("pull from GitHub", function()
+		local created, updated, same, failed = 0, 0, 0, {}
+		for _, f in ipairs(files or {}) do
+			local ok, err = pcall(function()
+				local okFind, existing = pcall(resolve, f.path)
+				if okFind and existing ~= game and existing:IsA("LuaSourceContainer") then
+					if getSource(existing) == f.source then
+						same += 1
+					else
+						setSource(existing, f.source)
+						updated += 1
+					end
+				else
+					local parent, name = ensurePath(f.path)
+					local className = (f.className == "LocalScript" or f.className == "ModuleScript") and f.className or "Script"
+					local inst = Instance.new(className)
+					inst.Name = name;
+					(inst :: any).Source = f.source
+					inst.Parent = parent
+					created += 1
+				end
+			end)
+			if not ok then
+				table.insert(failed, tostring(f.path) .. ": " .. tostring(err))
+			end
+		end
+		local msg = ("%d updated, %d created, %d unchanged"):format(updated, created, same)
+		if #failed > 0 then
+			msg ..= ("\n%d failed:\n%s"):format(#failed, table.concat(failed, "\n"))
+		end
+		return msg
+	end)
+end
+
+function Commands.export_scripts()
+	return { files = exportScripts() }
+end
+
+function Commands.import_scripts(args)
+	return importScripts(args.files)
+end
+
 local function compile(code)
 	-- Prefer loadstring when Studio allows it for plugins; otherwise use a temporary ModuleScript.
 	local okLs, fn, err = pcall(function()
@@ -996,6 +1146,17 @@ local connectorBox = textBox("(enter the relay URL first)", true)
 local copyButton = button("Copy connector link", true)
 local newTokenButton = button("Make a new secret URL", false)
 
+label("3. GitHub sync (optional)", { bold = true })
+label("Saves every script to your repo as .luau files in the \"place\" folder. The relay needs a GITHUB_TOKEN secret — see the README.", { dim = true, size = 13 })
+local repoBox = textBox("owner/repo, e.g. blockblock2/MyGame", true)
+repoBox.Text = githubRepo
+local branchBox = textBox("branch (main)", true)
+branchBox.Text = githubBranch
+local pushButton = button("Push to GitHub", true)
+local pullButton = button("Pull from GitHub", false)
+local autoButton = button("", false)
+local githubLabel = label("", { dim = true, size = 13 })
+
 label("Activity", { bold = true })
 local activityLabel = label("", { dim = true, size = 13 })
 activityLabel.Font = Enum.Font.Code
@@ -1132,6 +1293,7 @@ local function start()
 				place = game.Name,
 				placeId = game.PlaceId,
 				version = VERSION,
+				github = githubConfig(),
 			})
 			if myLoop ~= loopId then
 				break
@@ -1237,7 +1399,111 @@ copyButton.MouseButton1Click:Connect(function()
 	end)
 end)
 
+--------------------------------------------------------------------------------
+-- GitHub panel actions
+--------------------------------------------------------------------------------
+
+local githubBusy = false
+
+local function saveGithubFields()
+	githubRepo = repoBox.Text:gsub("^%s+", ""):gsub("%s+$", ""):gsub("^https?://github%.com/", ""):gsub("%.git$", ""):gsub("/+$", "")
+	githubBranch = branchBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+	if githubBranch == "" then
+		githubBranch = "main"
+	end
+	repoBox.Text = githubRepo
+	branchBox.Text = githubBranch
+	plugin:SetSetting(SETTING_GH_REPO, githubRepo)
+	plugin:SetSetting(SETTING_GH_BRANCH, githubBranch)
+end
+repoBox.FocusLost:Connect(saveGithubFields)
+branchBox.FocusLost:Connect(saveGithubFields)
+
+local function refreshAutoButton()
+	autoButton.Text = githubAutoPush and ("Auto-push: ON (every %d min)"):format(AUTO_PUSH_SECONDS // 60) or "Auto-push: OFF"
+end
+refreshAutoButton()
+
+local function githubRequest(op, body)
+	if serverUrl == "" then
+		error("Enter your relay URL first", 0)
+	end
+	if githubRepo == "" then
+		error("Enter your GitHub repo (owner/name) first", 0)
+	end
+	body.github = githubConfig()
+	local ok, res = post("/github/" .. op, body)
+	if not ok then
+		error(tostring(res), 0)
+	end
+	local okDecode, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	if not okDecode or type(data) ~= "table" then
+		error(("Relay answered %d %s"):format(res.StatusCode, res.StatusMessage), 0)
+	end
+	if not data.ok then
+		error(tostring(data.error), 0)
+	end
+	return data
+end
+
+local function githubPush(message)
+	local data = githubRequest("push", { files = exportScripts(), message = message })
+	return data.message
+end
+
+local function runGithub(label, fn)
+	if githubBusy then
+		return
+	end
+	githubBusy = true
+	githubLabel.Text = label .. "…"
+	task.spawn(function()
+		local ok, result = pcall(fn)
+		githubBusy = false
+		local text = tostring(result)
+		githubLabel.Text = (ok and "✓ " or "✗ ") .. text
+		logActivity((ok and "✓ " or "✗ ") .. label)
+	end)
+end
+
+pushButton.MouseButton1Click:Connect(function()
+	saveGithubFields()
+	runGithub("Pushing to GitHub", function()
+		return githubPush(nil)
+	end)
+end)
+
+pullButton.MouseButton1Click:Connect(function()
+	saveGithubFields()
+	runGithub("Pulling from GitHub", function()
+		local data = githubRequest("pull", {})
+		if type(data.files) ~= "table" or #data.files == 0 then
+			return "No scripts found in the repo's \"" .. SYNC_FOLDER .. "\" folder"
+		end
+		return importScripts(data.files)
+	end)
+end)
+
+autoButton.MouseButton1Click:Connect(function()
+	githubAutoPush = not githubAutoPush
+	plugin:SetSetting(SETTING_GH_AUTO, githubAutoPush)
+	refreshAutoButton()
+end)
+
+local autoLoopAlive = true
+task.spawn(function()
+	while autoLoopAlive do
+		task.wait(AUTO_PUSH_SECONDS)
+		if autoLoopAlive and githubAutoPush and running and githubRepo ~= "" and not githubBusy then
+			runGithub("Auto-push", function()
+				return githubPush("Auto-sync from Roblox Studio")
+			end)
+		end
+	end
+end)
+
 plugin.Unloading:Connect(function()
+	autoLoopAlive = false
 	running = false
 	loopId += 1
 	outputConn:Disconnect()

@@ -2,6 +2,8 @@
 
 **Link Claude to Roblox Studio.** Once connected, Claude (on claude.ai, in a browser or the app) can read and edit the place you have open in Studio: browse the Explorer, change properties, build parts and models, write and edit scripts, read the Output window and run Luau.
 
+It can also **sync your scripts to a GitHub repo**, so your game's code is backed up and versioned, and Claude can read it on GitHub too.
+
 ```
 Claude ──custom connector──▶ Cloudflare Worker (relay) ◀──long-poll── StudioLink plugin (inside Studio)
 ```
@@ -71,6 +73,66 @@ From then on, the plugin reconnects automatically every time you open Studio.
 
 ---
 
+## Step 5 (optional): Sync scripts to GitHub
+
+StudioLink can save every script in your place to a GitHub repo as `.luau` files and load them back into Studio.
+
+### 5a. Make a GitHub token
+
+1. On GitHub, go to **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
+2. Under **Repository access**, choose **Only select repositories** and pick the repo for your game.
+   The repo needs at least one commit; a README is enough.
+3. Under **Repository permissions**, set **Contents** to **Read and write**.
+4. Generate the token and copy it.
+
+### 5b. Give the token to your relay
+
+In the `worker` folder:
+
+```bash
+npx wrangler secret put GITHUB_TOKEN
+# paste the token when asked
+npx wrangler deploy
+```
+
+The token is stored as an encrypted secret on Cloudflare. It is never put in the plugin or sent to Studio.
+
+### 5c. Pick the repo in Studio
+
+In the Studio Link panel, under **3. GitHub sync**:
+
+1. Enter the repo as `owner/name`, for example `blockblock2/MyGame`, and the branch (`main` by default).
+2. Click **Push to GitHub**. The panel shows how many files were added, changed or removed.
+
+| Button | What it does |
+|---|---|
+| **Push to GitHub** | Commits every script in the place. Only changed files go into the commit, and scripts you deleted in Studio are removed from the repo. |
+| **Pull from GitHub** | Loads the repo's scripts into Studio, updating existing scripts and creating missing ones (missing folders are created too). It **never deletes** anything in Studio, and you can undo it with ⌘Z / Ctrl+Z. |
+| **Auto-push** | When ON, pushes every 5 minutes while connected. It only makes a commit when something actually changed. |
+
+Claude can do the same with the `github_push` and `github_pull` tools, for example: *"push my scripts to GitHub with the message 'add round system'"*.
+
+### What the repo looks like
+
+Scripts are saved in a `place/` folder that mirrors the Explorer:
+
+```
+place/
+├── ServerScriptService/
+│   └── RoundManager.server.luau     ← Script
+├── ReplicatedStorage/
+│   └── Modules/
+│       └── Util.luau                ← ModuleScript
+├── StarterPlayer/
+│   └── StarterPlayerScripts/
+│       └── Input.client.luau        ← LocalScript
+└── studio-link.json                 ← maps each file back to its exact place in Studio
+```
+
+Only scripts are synced. Parts, models, GUIs and other objects stay in your place file, and anything outside `place/` in the repo is left untouched.
+
+---
+
 ## What Claude can do
 
 | Tool | What it does |
@@ -84,6 +146,7 @@ From then on, the plugin reconnects automatically every time you open Studio.
 | `get_selection` / `set_selection` | Reads what you've selected, or selects things to show you |
 | `get_output` | Reads the Output window (prints, warnings, errors) |
 | `run_luau` | Runs any Luau code in edit mode |
+| `github_push` / `github_pull` | Syncs scripts with your GitHub repo |
 
 Every change appears in Studio's undo history as **"Claude: …"**, so **⌘Z / Ctrl+Z** undoes it.
 
@@ -103,10 +166,15 @@ Reinstalling the plugin also creates a new secret, so update the connector in Cl
 | **The Studio Link button is missing** | Stop any Play test (the plugin hides during Play), then check the Plugins folder and look in **View → Output** for red errors mentioning StudioLink. |
 | **Claude says Studio isn't connected** | Make sure the panel shows the green dot and that Claude's connector uses the *current* link from box 2. |
 | **Claude says "MCP server not allowed"** | The connector was changed or removed during the chat. Start a new chat. |
+| **GitHub: "relay has no GitHub token"** | Run `npx wrangler secret put GITHUB_TOKEN`, then `npx wrangler deploy` (step 5b). |
+| **GitHub: 401** | The token is wrong or expired. Make a new one and put it again. |
+| **GitHub: 403 / 404** | Check the repo name, and that the token can access that repo with Contents read and write. |
+| **GitHub: 409 "repo is empty"** | Add a README to the repo on GitHub first. |
 | **A tool timed out** | The command may still have run. Ask Claude to check before it retries. |
 
 ## How it works
 
 - The **plugin** keeps one request open to the relay (about 20 seconds at a time) and waits for work. When Claude calls a tool, the relay hands the command to the plugin. The plugin runs it in Studio and posts the result back.
 - The **relay** (`worker/src/index.js`) is a Cloudflare Worker that speaks MCP over Streamable HTTP. A Durable Object, keyed by your secret, connects Claude's calls to your Studio session.
-- No data is stored. Commands and results pass through memory only.
+- **GitHub sync** uses GitHub's Git Data API to make one commit per push with only the changed files. Pull reads all files in one GraphQL request.
+- The relay stores nothing. Commands and results pass through memory only, and your GitHub token is kept as a Cloudflare secret.
